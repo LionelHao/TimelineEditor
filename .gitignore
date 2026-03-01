@@ -21,6 +21,7 @@ build/
 # Android build files
 app/build/
 app/.cxx/
+app/src/main/jniLibs/
 
 # Environment variables
 .env
