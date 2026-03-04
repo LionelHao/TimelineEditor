@@ -5,14 +5,23 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
 #include "Timeline.h"
 #include "TimelineEncoder.h"
+#include "TimelineGLRender.h"
 #include "VideoFilter.h"
 #include "WatermarkFilter.h"
 #include "HistogramEqualizationFilter.h"
+#include "NativeRender.h"
 
 extern "C" {
+#include <libavutil/frame.h>
+#include <libavutil/pixfmt.h>
+#include <libswscale/swscale.h>
 #include <GLES3/gl3.h>
+#include <android/native_window.h>
 }
 
 enum class EditorState {
@@ -22,6 +31,15 @@ enum class EditorState {
     EDITOR_STATE_EXPORTING,
     EDITOR_STATE_ERROR
 };
+
+constexpr int MSG_EXPORT_PROGRESS = 100;
+constexpr int MSG_EXPORT_COMPLETE = 101;
+constexpr int MSG_EXPORT_ERROR = 102;
+constexpr int MSG_PREVIEW_FRAME = 200;
+constexpr int MSG_PREVIEW_POSITION = 201;
+
+constexpr int RENDER_TYPE_OPENGL = 0;
+constexpr int RENDER_TYPE_ANWINDOW = 1;
 
 typedef void (*EditorProgressCallback)(void* context, int progress, int total);
 typedef void (*EditorCompleteCallback)(void* context, int result);
@@ -60,9 +78,21 @@ public:
     float GetExportProgress();
     bool IsExporting();
 
+    int SetPreviewSurface(ANativeWindow* window);
     int PreviewFrame(int64_t positionMs);
     int StartPreview();
     void StopPreview();
+    void PausePreview();
+    void ResumePreview();
+    bool IsPreviewing();
+    bool IsPreviewPaused();
+
+    int SeekToPosition(int64_t positionMs);
+
+    int OnSurfaceCreated(int renderType);
+    int OnSurfaceChanged(int renderType, int width, int height);
+    int OnDrawFrame(int renderType);
+    bool CheckAndClearNeedRender();
 
     EditorState GetState() const { return m_state; }
     Timeline* GetTimeline() { return m_timeline; }
@@ -82,6 +112,13 @@ private:
     void UnInitFilters();
 
     int ApplyFilters(NativeImage* input, NativeImage* output);
+
+    int InitPreviewRenderer();
+    void UninitPreviewRenderer();
+    void PreviewThreadFunc();
+    void DecodeThreadFunc();
+    int RenderPreviewFrame(int64_t positionMs);
+    void NotifyPositionChanged(int64_t positionMs);
 
     static void OnEncodeProgress(void* context, int progress, int total);
     static void OnEncodeComplete(void* context, int result);
@@ -117,6 +154,32 @@ private:
     EditorProgressCallback m_progressCallback;
     void* m_completeContext;
     EditorCompleteCallback m_completeCallback;
+
+    ANativeWindow* m_previewWindow;
+    NativeRender* m_previewRenderer;
+    TimelineGLRender* m_glRender;
+    std::thread* m_previewThread;
+    std::thread* m_decodeThread;
+    std::atomic<bool> m_previewRunning;
+    std::atomic<bool> m_previewPaused;
+    std::atomic<bool> m_needRender;
+    std::condition_variable m_previewCV;
+    std::mutex m_previewMutex;
+    int m_previewWidth;
+    int m_previewHeight;
+    int m_renderType;
+    int m_surfaceWidth;
+    int m_surfaceHeight;
+
+    struct SwsContext* m_swsContext;
+    int m_swsContextSrcWidth;
+    int m_swsContextSrcHeight;
+    AVPixelFormat m_swsContextSrcFormat;
+    int m_swsContextDstWidth;
+    int m_swsContextDstHeight;
+
+    AVFrame* m_rgbaFrame;
+    uint8_t* m_rgbaBuffer;
 };
 
 #endif

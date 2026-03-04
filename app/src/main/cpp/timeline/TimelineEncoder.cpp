@@ -2,6 +2,7 @@
 #include "LogUtil.h"
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
 
 #define TAG "TimelineEncoder"
 #define TIMEOUT_US 100000
@@ -256,6 +257,10 @@ int TimelineEncoder::StartEncoding(Timeline* timeline) {
     m_lastProcessedClipIndex = -1;
     m_lastPresentationPts = -1;
     
+    // 清空性能数据
+    m_framePerformanceData.clear();
+    clock_gettime(CLOCK_MONOTONIC, &m_exportStartTime);
+    
     // 分配帧缓存（如果还没有分配）
     if (!m_lastFrameCache) {
         m_lastFrameCache = av_frame_alloc();
@@ -310,7 +315,7 @@ void TimelineEncoder::EncodeThreadFunc(TimelineEncoder* encoder) {
     
     // 在编码线程中初始化 OpenGL 上下文
     if (encoder->m_useOpenGL && encoder->m_glRender) {
-        if (encoder->m_glRender->Init(encoder->m_config.width, encoder->m_config.height) == 0) {
+        if (encoder->m_glRender->Init() == 0) {
             LOGCATE("%s: OpenGL renderer initialized in encode thread", TAG);
             
             // 检查是否有待设置的水印信息
@@ -419,6 +424,10 @@ void TimelineEncoder::EncodeThreadFunc(TimelineEncoder* encoder) {
         }
     }
     
+    // 记录导出结束时间并保存性能数据
+    clock_gettime(CLOCK_MONOTONIC, &encoder->m_exportEndTime);
+    encoder->SavePerformanceData();
+    
     encoder->m_state = EncoderState::ENCODER_STATE_READY;
     encoder->m_isEncoding = false;
     
@@ -503,7 +512,12 @@ int TimelineEncoder::ProcessTimelineFrame(Timeline* timeline, int64_t frameIndex
     }
     
     AVFrame* frame = nullptr;
+    // 开始解码计时
+    struct timespec decodeStart, decodeEnd;
+    clock_gettime(CLOCK_MONOTONIC, &decodeStart);
     int decodeResult = clip->DecodeFrame(&frame);
+    clock_gettime(CLOCK_MONOTONIC, &decodeEnd);
+    double decodeTime = (decodeEnd.tv_sec - decodeStart.tv_sec) * 1000.0 + (decodeEnd.tv_nsec - decodeStart.tv_nsec) / 1000000.0;
     
     // 处理 EOF 情况：如果解码到文件末尾
     if (decodeResult == AVERROR_EOF) {
@@ -571,11 +585,16 @@ int TimelineEncoder::ProcessTimelineFrame(Timeline* timeline, int64_t frameIndex
     uint8_t* nv12Data = nullptr;
     int nv12Size = 0;
     
+    // 开始渲染计时
+    struct timespec renderStart, renderEnd;
+    clock_gettime(CLOCK_MONOTONIC, &renderStart);
     // 使用 OpenGL 或 CPU 转换帧格式
     if (ConvertFrameToNV12(frame, &nv12Data, &nv12Size) != 0) {
         LOGCATE("%s: ConvertFrameToNV12 failed", TAG);
         return -1;
     }
+    clock_gettime(CLOCK_MONOTONIC, &renderEnd);
+    double renderTime = (renderEnd.tv_sec - renderStart.tv_sec) * 1000.0 + (renderEnd.tv_nsec - renderStart.tv_nsec) / 1000000.0;
     
     LOGCATE("%s: Frame converted, OpenGL=%s, size=%d", TAG, m_useOpenGL ? "yes" : "no", nv12Size);
     
@@ -598,10 +617,18 @@ int TimelineEncoder::ProcessTimelineFrame(Timeline* timeline, int64_t frameIndex
     
     LOGCATE("%s: Frame %lld, frameRate=%d, presentationTimeUs=%lld", 
             TAG, (long long)frameIndex, m_config.frameRate, (long long)presentationTimeUs);
+    
+    // 开始编码计时（仅统计输入提交时间）
+    struct timespec encodeStart, encodeEnd;
+    clock_gettime(CLOCK_MONOTONIC, &encodeStart);
     int result = FeedEncoderInput(nv12Data, nv12Size, presentationTimeUs);
+    clock_gettime(CLOCK_MONOTONIC, &encodeEnd);
+    double encodeTime = (encodeEnd.tv_sec - encodeStart.tv_sec) * 1000.0 + (encodeEnd.tv_nsec - encodeStart.tv_nsec) / 1000000.0;
     
     LOGCATE("%s: Fed encoder input, result=%d", TAG, result);
     
+    // 异步处理输出，不阻塞当前帧处理
+    // 每帧都尝试处理输出，但使用0超时避免阻塞
     DrainEncoder(false);
     
     if (nv12Data) {
@@ -609,6 +636,14 @@ int TimelineEncoder::ProcessTimelineFrame(Timeline* timeline, int64_t frameIndex
     }
     
     LOGCATE("%s: Frame %lld processed successfully", TAG, (long long)frameIndex);
+    
+    // 保存性能数据
+    FramePerformanceData perfData;
+    perfData.frameIndex = frameIndex;
+    perfData.decodeTime = decodeTime;
+    perfData.renderTime = renderTime;
+    perfData.encodeTime = encodeTime;
+    m_framePerformanceData.push_back(perfData);
     
     return result;
 }
@@ -712,14 +747,14 @@ int TimelineEncoder::DrainEncoder(bool endOfStream) {
     int outputFrameCount = 0;
     
     while (true) {
-        outputIndex = AMediaCodec_dequeueOutputBuffer(m_videoCodec, &info, TIMEOUT_US);
+        // 非结束状态时使用0超时，避免阻塞渲染线程
+        int64_t timeout = endOfStream ? TIMEOUT_US : 0;
+        outputIndex = AMediaCodec_dequeueOutputBuffer(m_videoCodec, &info, timeout);
         
         if (outputIndex < 0) {
             if (outputIndex == AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
-                if (!endOfStream) {
-                    break;
-                }
-                continue;
+                // 非结束状态下，没有数据立即退出，不阻塞
+                break;
             } else if (outputIndex == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
                 if (m_videoTrackIndex < 0) {
                     AMediaFormat* format = AMediaCodec_getOutputFormat(m_videoCodec);
@@ -854,5 +889,140 @@ int TimelineEncoder::Finalize() {
         AMediaMuxer_stop(m_mediaMuxer);
     }
     
+    // 记录导出结束时间
+    clock_gettime(CLOCK_MONOTONIC, &m_exportEndTime);
+    
+    // 保存性能数据
+    SavePerformanceData();
+    
     return 0;
+}
+
+double TimelineEncoder::CalculatePercentile(const std::vector<double>& data, double percentile) {
+    if (data.empty()) {
+        return 0.0;
+    }
+    
+    std::vector<double> sortedData = data;
+    std::sort(sortedData.begin(), sortedData.end());
+    
+    double index = (percentile / 100.0) * (sortedData.size() - 1);
+    int lowerIndex = (int)index;
+    int upperIndex = lowerIndex + 1;
+    
+    if (upperIndex >= (int)sortedData.size()) {
+        return sortedData[lowerIndex];
+    }
+    
+    double fraction = index - lowerIndex;
+    return sortedData[lowerIndex] + fraction * (sortedData[upperIndex] - sortedData[lowerIndex]);
+}
+
+void TimelineEncoder::SavePerformanceData() {
+    if (m_framePerformanceData.empty()) {
+        LOGCATE("%s: No performance data to save", TAG);
+        return;
+    }
+    
+    // 计算导出总耗时（秒）
+    double totalExportTime = (m_exportEndTime.tv_sec - m_exportStartTime.tv_sec) + 
+                           (m_exportEndTime.tv_nsec - m_exportStartTime.tv_nsec) / 1000000000.0;
+    
+    // 收集各项耗时数据
+    std::vector<double> decodeTimes;
+    std::vector<double> renderTimes;
+    std::vector<double> encodeTimes;
+    
+    for (const auto& perf : m_framePerformanceData) {
+        decodeTimes.push_back(perf.decodeTime);
+        renderTimes.push_back(perf.renderTime);
+        encodeTimes.push_back(perf.encodeTime);
+    }
+    
+    // 计算平均值
+    double avgDecode = 0.0, avgRender = 0.0, avgEncode = 0.0;
+    for (const auto& perf : m_framePerformanceData) {
+        avgDecode += perf.decodeTime;
+        avgRender += perf.renderTime;
+        avgEncode += perf.encodeTime;
+    }
+    avgDecode /= m_framePerformanceData.size();
+    avgRender /= m_framePerformanceData.size();
+    avgEncode /= m_framePerformanceData.size();
+    
+    // 计算百分位数
+    double p5Decode = CalculatePercentile(decodeTimes, 5.0);
+    double p50Decode = CalculatePercentile(decodeTimes, 50.0);
+    double p95Decode = CalculatePercentile(decodeTimes, 95.0);
+    
+    double p5Render = CalculatePercentile(renderTimes, 5.0);
+    double p50Render = CalculatePercentile(renderTimes, 50.0);
+    double p95Render = CalculatePercentile(renderTimes, 95.0);
+    
+    double p5Encode = CalculatePercentile(encodeTimes, 5.0);
+    double p50Encode = CalculatePercentile(encodeTimes, 50.0);
+    double p95Encode = CalculatePercentile(encodeTimes, 95.0);
+    
+    // 计算平均每秒导出帧数
+    double avgFps = m_framePerformanceData.size() / totalExportTime;
+    
+    // 生成JSON文件路径
+    std::string outputPath = m_config.outputPath;
+    size_t dotPos = outputPath.find_last_of('.');
+    std::string jsonPath = outputPath.substr(0, dotPos) + ".json";
+    
+    // 构建JSON内容
+    std::stringstream json;
+    json << "{\n";
+    json << "  \"summary\": {\n";
+    json << "    \"totalExportTime\": " << totalExportTime << ",\n";
+    json << "    \"totalFrames\": " << m_framePerformanceData.size() << ",\n";
+    json << "    \"avgFps\": " << avgFps << "\n";
+    json << "  },\n";
+    json << "  \"decode\": {\n";
+    json << "    \"avg\": " << avgDecode << ",\n";
+    json << "    \"p5\": " << p5Decode << ",\n";
+    json << "    \"p50\": " << p50Decode << ",\n";
+    json << "    \"p95\": " << p95Decode << "\n";
+    json << "  },\n";
+    json << "  \"render\": {\n";
+    json << "    \"avg\": " << avgRender << ",\n";
+    json << "    \"p5\": " << p5Render << ",\n";
+    json << "    \"p50\": " << p50Render << ",\n";
+    json << "    \"p95\": " << p95Render << "\n";
+    json << "  },\n";
+    json << "  \"encode\": {\n";
+    json << "    \"avg\": " << avgEncode << ",\n";
+    json << "    \"p5\": " << p5Encode << ",\n";
+    json << "    \"p50\": " << p50Encode << ",\n";
+    json << "    \"p95\": " << p95Encode << "\n";
+    json << "  },\n";
+    json << "  \"frames\": [\n";
+    
+    for (size_t i = 0; i < m_framePerformanceData.size(); i++) {
+        const auto& perf = m_framePerformanceData[i];
+        json << "    {\n";
+        json << "      \"frameIndex\": " << perf.frameIndex << ",\n";
+        json << "      \"decodeTime\": " << perf.decodeTime << ",\n";
+        json << "      \"renderTime\": " << perf.renderTime << ",\n";
+        json << "      \"encodeTime\": " << perf.encodeTime << "\n";
+        json << "    }";
+        if (i < m_framePerformanceData.size() - 1) {
+            json << ",";
+        }
+        json << "\n";
+    }
+    
+    json << "  ]\n";
+    json << "}\n";
+    
+    // 写入文件
+    std::ofstream file(jsonPath);
+    if (file.is_open()) {
+        file << json.str();
+        file.close();
+        LOGCATE("%s: Performance data saved to %s", TAG, jsonPath.c_str());
+    } else {
+        LOGCATE("%s: Failed to open file for writing: %s", TAG, jsonPath.c_str());
+    }
 }

@@ -13,6 +13,7 @@ TimelineClip::TimelineClip()
     , m_pPacket(nullptr)
     , m_pSwsContext(nullptr)
     , m_currentPts(0)
+    , m_seekTarget(-1)
     , m_isOpened(false)
 {
 }
@@ -196,16 +197,22 @@ int TimelineClip::SeekToTime(int64_t timestamp) {
         return -1;
     }
 
-    int64_t seekTarget = av_rescale_q(timestamp, AV_TIME_BASE_Q, m_pVideoStream->time_base);
+    // 使用 avformat_seek_file 进行精确 seek
+    int64_t seek_target = timestamp;
+    int64_t seek_min = INT64_MIN;
+    int64_t seek_max = INT64_MAX;
     
-    int ret = av_seek_frame(m_pFormatCtx, m_videoStreamIndex, seekTarget, AVSEEK_FLAG_BACKWARD);
+    int ret = avformat_seek_file(m_pFormatCtx, m_videoStreamIndex, seek_min, seek_target, seek_max, 0);
     if (ret < 0) {
-        LOGCATE("%s: av_seek_frame failed, ret=%d", TAG, ret);
+        LOGCATE("%s: avformat_seek_file failed, ret=%d", TAG, ret);
         return ret;
     }
 
     avcodec_flush_buffers(m_pCodecCtx);
-    m_currentPts = timestamp;
+    m_seekTarget = timestamp;
+    m_currentPts = -1;
+
+    LOGCATE("%s: Seek to timestamp %ld", TAG, timestamp);
 
     return 0;
 }
@@ -242,14 +249,29 @@ int TimelineClip::DecodeFrame(AVFrame** ppFrame) {
 
         ret = avcodec_receive_frame(m_pCodecCtx, m_pFrame);
         if (ret == 0) {
+            // 计算当前帧的 PTS（微秒）
+            int64_t framePtsUs = 0;
+            if (m_pFrame->pts != AV_NOPTS_VALUE) {
+                framePtsUs = av_rescale_q(m_pFrame->pts, 
+                                          m_pVideoStream->time_base, 
+                                          AV_TIME_BASE_Q);
+            }
+            
+            // 如果设置了 seek 目标，跳过目标之前的帧
+            if (m_seekTarget >= 0 && framePtsUs < m_seekTarget) {
+                LOGCATE("%s: Skipping frame at pts=%ld, seekTarget=%ld", TAG, framePtsUs, m_seekTarget);
+                av_packet_unref(m_pPacket);
+                continue;
+            }
+            
+            // 找到目标帧，清除 seek 目标
+            m_seekTarget = -1;
+            
             gotFrame = true;
             *ppFrame = m_pFrame;
+            m_currentPts = framePtsUs;
             
-            if (m_pFrame->pts != AV_NOPTS_VALUE) {
-                m_currentPts = av_rescale_q(m_pFrame->pts, 
-                                            m_pVideoStream->time_base, 
-                                            AV_TIME_BASE_Q);
-            }
+            LOGCATE("%s: Got frame at pts=%ld", TAG, m_currentPts);
         } else if (ret == AVERROR(EAGAIN)) {
             av_packet_unref(m_pPacket);
             continue;

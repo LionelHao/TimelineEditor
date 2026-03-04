@@ -1,5 +1,7 @@
 package com.lionel.timelineeditor;
 
+import android.view.Surface;
+
 public class TimelineEditor {
     static {
         System.loadLibrary("timeline-editor");
@@ -15,6 +17,11 @@ public class TimelineEditor {
     public static final int MSG_EXPORT_PROGRESS = 100;
     public static final int MSG_EXPORT_COMPLETE = 101;
     public static final int MSG_EXPORT_ERROR = 102;
+    public static final int MSG_PREVIEW_FRAME = 200;
+    public static final int MSG_PREVIEW_POSITION = 201;
+
+    public static final int RENDER_TYPE_OPENGL = 0;
+    public static final int RENDER_TYPE_ANWINDOW = 1;
 
     private long mNativeHandle = 0;
     private EventCallback mEventCallback = null;
@@ -72,6 +79,10 @@ public class TimelineEditor {
         native_SetCurrentPosition(mNativeHandle, positionMs);
     }
 
+    public void seekToPosition(int positionMs) {
+        native_SetCurrentPosition(mNativeHandle, positionMs);
+    }
+
     public int setWatermark(String imagePath, int position, float opacity, float scale) {
         return native_SetWatermark(mNativeHandle, imagePath, position, opacity, scale);
     }
@@ -112,6 +123,54 @@ public class TimelineEditor {
         return native_IsExporting(mNativeHandle);
     }
 
+    public int setPreviewSurface(Surface surface) {
+        return native_SetPreviewSurface(mNativeHandle, surface);
+    }
+
+    public int startPreview() {
+        return native_StartPreview(mNativeHandle);
+    }
+
+    public void stopPreview() {
+        native_StopPreview(mNativeHandle);
+    }
+
+    public void pausePreview() {
+        native_PausePreview(mNativeHandle);
+    }
+
+    public void resumePreview() {
+        native_ResumePreview(mNativeHandle);
+    }
+
+    public int previewFrame(long positionMs) {
+        return native_PreviewFrame(mNativeHandle, positionMs);
+    }
+
+    public boolean isPreviewing() {
+        return native_IsPreviewing(mNativeHandle);
+    }
+
+    public boolean isPreviewPaused() {
+        return native_IsPreviewPaused(mNativeHandle);
+    }
+
+    public int onSurfaceCreated(int renderType) {
+        return native_OnSurfaceCreated(mNativeHandle, renderType);
+    }
+
+    public int onSurfaceChanged(int renderType, int width, int height) {
+        return native_OnSurfaceChanged(mNativeHandle, renderType, width, height);
+    }
+
+    public int onDrawFrame(int renderType) {
+        return native_OnDrawFrame(mNativeHandle, renderType);
+    }
+
+    public boolean checkAndClearNeedRender() {
+        return native_CheckAndClearNeedRender(mNativeHandle);
+    }
+
     public void addEventCallback(EventCallback callback) {
         mEventCallback = callback;
     }
@@ -144,4 +203,18 @@ public class TimelineEditor {
     private native void native_ResumeExport(long handle);
     private native float native_GetExportProgress(long handle);
     private native boolean native_IsExporting(long handle);
+
+    private native int native_SetPreviewSurface(long handle, Surface surface);
+    private native int native_StartPreview(long handle);
+    private native void native_StopPreview(long handle);
+    private native void native_PausePreview(long handle);
+    private native void native_ResumePreview(long handle);
+    private native int native_PreviewFrame(long handle, long positionMs);
+    private native boolean native_IsPreviewing(long handle);
+    private native boolean native_IsPreviewPaused(long handle);
+
+    private native int native_OnSurfaceCreated(long handle, int renderType);
+    private native int native_OnSurfaceChanged(long handle, int renderType, int width, int height);
+    private native int native_OnDrawFrame(long handle, int renderType);
+    private native boolean native_CheckAndClearNeedRender(long handle);
 }

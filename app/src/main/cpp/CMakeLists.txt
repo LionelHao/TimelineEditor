@@ -16,7 +16,8 @@ link_directories(
 
 file(GLOB src-files
         ${CMAKE_SOURCE_DIR}/util/*.cpp
-        ${CMAKE_SOURCE_DIR}/timeline/*.cpp)
+        ${CMAKE_SOURCE_DIR}/timeline/*.cpp
+        ${CMAKE_SOURCE_DIR}/timeline/NativeRender.cpp)
 
 add_library(${libname}
              SHARED

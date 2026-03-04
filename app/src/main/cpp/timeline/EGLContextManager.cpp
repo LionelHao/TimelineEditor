@@ -109,6 +109,26 @@ int EGLContextManager::Init(int width, int height) {
     return 0;
 }
 
+int EGLContextManager::InitWithExternalContext(EGLContext eglContext, EGLDisplay eglDisplay) {
+    if (m_initialized) {
+        LOGCATE("%s: Already initialized", TAG);
+        return 0;
+    }
+
+    m_display = eglDisplay;
+    m_context = eglContext;
+    m_surface = EGL_NO_SURFACE;
+    m_initialized = true;
+    
+    LOGCATE("%s: EGL context initialized with external context", TAG);
+    
+    LOGCATE("%s: GL_VERSION: %s", TAG, glGetString(GL_VERSION));
+    LOGCATE("%s: GL_VENDOR: %s", TAG, glGetString(GL_VENDOR));
+    LOGCATE("%s: GL_RENDERER: %s", TAG, glGetString(GL_RENDERER));
+    
+    return 0;
+}
+
 void EGLContextManager::Uninit() {
     if (!m_initialized) {
         return;
@@ -144,6 +164,11 @@ bool EGLContextManager::MakeCurrent() {
         return false;
     }
 
+    if (m_surface == EGL_NO_SURFACE) {
+        LOGCATE("%s: MakeCurrent - surface is EGL_NO_SURFACE, skipping", TAG);
+        return true;
+    }
+
     return eglMakeCurrent(m_display, m_surface, m_surface, m_context);
 }
 
@@ -154,7 +179,9 @@ void EGLContextManager::DoneCurrent() {
 }
 
 void EGLContextManager::SwapBuffers() {
-    if (m_initialized) {
-        eglSwapBuffers(m_display, m_surface);
+    if (m_initialized && m_surface != EGL_NO_SURFACE) {
+        if (!eglSwapBuffers(m_display, m_surface)) {
+            LOGCATE("%s: eglSwapBuffers failed, error=%x", TAG, eglGetError());
+        }
     }
 }

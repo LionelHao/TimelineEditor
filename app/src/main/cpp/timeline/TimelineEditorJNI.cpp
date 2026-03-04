@@ -2,6 +2,8 @@
 #include <string>
 #include "TimelineEditor.h"
 #include "LogUtil.h"
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
 
 #define TAG "TimelineEditorJNI"
 
@@ -226,6 +228,116 @@ Java_com_lionel_timelineeditor_TimelineEditor_native_1IsExporting(JNIEnv* env, j
     TimelineEditor* editor = reinterpret_cast<TimelineEditor*>(handle);
     if (editor) {
         return editor->IsExporting();
+    }
+    return JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_lionel_timelineeditor_TimelineEditor_native_1SetPreviewSurface(JNIEnv* env, jobject thiz, 
+                                                                              jlong handle, jobject surface) {
+    TimelineEditor* editor = reinterpret_cast<TimelineEditor*>(handle);
+    if (editor) {
+        ANativeWindow* window = nullptr;
+        if (surface != nullptr) {
+            window = ANativeWindow_fromSurface(env, surface);
+        }
+        return editor->SetPreviewSurface(window);
+    }
+    return -1;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_lionel_timelineeditor_TimelineEditor_native_1StartPreview(JNIEnv* env, jobject thiz, jlong handle) {
+    TimelineEditor* editor = reinterpret_cast<TimelineEditor*>(handle);
+    if (editor) {
+        return editor->StartPreview();
+    }
+    return -1;
+}
+
+JNIEXPORT void JNICALL
+Java_com_lionel_timelineeditor_TimelineEditor_native_1StopPreview(JNIEnv* env, jobject thiz, jlong handle) {
+    TimelineEditor* editor = reinterpret_cast<TimelineEditor*>(handle);
+    if (editor) {
+        editor->StopPreview();
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_lionel_timelineeditor_TimelineEditor_native_1PausePreview(JNIEnv* env, jobject thiz, jlong handle) {
+    TimelineEditor* editor = reinterpret_cast<TimelineEditor*>(handle);
+    if (editor) {
+        editor->PausePreview();
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_lionel_timelineeditor_TimelineEditor_native_1ResumePreview(JNIEnv* env, jobject thiz, jlong handle) {
+    TimelineEditor* editor = reinterpret_cast<TimelineEditor*>(handle);
+    if (editor) {
+        editor->ResumePreview();
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_com_lionel_timelineeditor_TimelineEditor_native_1PreviewFrame(JNIEnv* env, jobject thiz, 
+                                                                         jlong handle, jlong positionMs) {
+    TimelineEditor* editor = reinterpret_cast<TimelineEditor*>(handle);
+    if (editor) {
+        return editor->PreviewFrame(positionMs);
+    }
+    return -1;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_lionel_timelineeditor_TimelineEditor_native_1IsPreviewing(JNIEnv* env, jobject thiz, jlong handle) {
+    TimelineEditor* editor = reinterpret_cast<TimelineEditor*>(handle);
+    if (editor) {
+        return editor->IsPreviewing();
+    }
+    return JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_lionel_timelineeditor_TimelineEditor_native_1IsPreviewPaused(JNIEnv* env, jobject thiz, jlong handle) {
+    TimelineEditor* editor = reinterpret_cast<TimelineEditor*>(handle);
+    if (editor) {
+        return editor->IsPreviewPaused();
+    }
+    return JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_lionel_timelineeditor_TimelineEditor_native_1OnSurfaceCreated(JNIEnv* env, jobject thiz, jlong handle, jint renderType) {
+    TimelineEditor* editor = reinterpret_cast<TimelineEditor*>(handle);
+    if (editor) {
+        return editor->OnSurfaceCreated(renderType);
+    }
+    return -1;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_lionel_timelineeditor_TimelineEditor_native_1OnSurfaceChanged(JNIEnv* env, jobject thiz, jlong handle, jint renderType, jint width, jint height) {
+    TimelineEditor* editor = reinterpret_cast<TimelineEditor*>(handle);
+    if (editor) {
+        return editor->OnSurfaceChanged(renderType, width, height);
+    }
+    return -1;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_lionel_timelineeditor_TimelineEditor_native_1OnDrawFrame(JNIEnv* env, jobject thiz, jlong handle, jint renderType) {
+    TimelineEditor* editor = reinterpret_cast<TimelineEditor*>(handle);
+    if (editor) {
+        return editor->OnDrawFrame(renderType);
+    }
+    return -1;
+}
+
+jboolean Java_com_lionel_timelineeditor_TimelineEditor_native_1CheckAndClearNeedRender(JNIEnv* env, jobject thiz, jlong handle) {
+    TimelineEditor* editor = reinterpret_cast<TimelineEditor*>(handle);
+    if (editor) {
+        return editor->CheckAndClearNeedRender() ? JNI_TRUE : JNI_FALSE;
     }
     return JNI_FALSE;
 }

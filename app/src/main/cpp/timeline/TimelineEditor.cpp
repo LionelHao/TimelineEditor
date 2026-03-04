@@ -25,6 +25,26 @@ TimelineEditor::TimelineEditor()
     , m_progressCallback(nullptr)
     , m_completeContext(nullptr)
     , m_completeCallback(nullptr)
+    , m_previewWindow(nullptr)
+    , m_previewRenderer(nullptr)
+    , m_glRender(nullptr)
+    , m_previewThread(nullptr)
+    , m_decodeThread(nullptr)
+    , m_previewRunning(false)
+    , m_previewPaused(false)
+    , m_previewWidth(1920)
+    , m_previewHeight(1080)
+    , m_renderType(RENDER_TYPE_ANWINDOW)
+    , m_surfaceWidth(0)
+    , m_surfaceHeight(0)
+    , m_swsContext(nullptr)
+    , m_swsContextSrcWidth(0)
+    , m_swsContextSrcHeight(0)
+    , m_swsContextSrcFormat(AV_PIX_FMT_NONE)
+    , m_swsContextDstWidth(0)
+    , m_swsContextDstHeight(0)
+    , m_rgbaFrame(nullptr)
+    , m_rgbaBuffer(nullptr)
 {
 }
 
@@ -80,6 +100,8 @@ int TimelineEditor::Init(JNIEnv* env, jobject obj) {
 }
 
 void TimelineEditor::UnInit() {
+    StopPreview();
+    
     DestroyTimeline();
 
     UnInitFilters();
@@ -542,15 +564,482 @@ JavaVM* TimelineEditor::GetJavaVM() {
     return m_javaVM;
 }
 
-int TimelineEditor::PreviewFrame(int64_t positionMs) {
+int TimelineEditor::SetPreviewSurface(ANativeWindow* window) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    
+    if (m_previewWindow) {
+        ANativeWindow_release(m_previewWindow);
+        m_previewWindow = nullptr;
+    }
+    
+    m_previewWindow = window;
+    
+    if (m_previewWindow) {
+        // 增加引用计数，防止Java层销毁Surface时指针悬空
+        ANativeWindow_acquire(m_previewWindow);
+        m_previewWidth = ANativeWindow_getWidth(m_previewWindow);
+        m_previewHeight = ANativeWindow_getHeight(m_previewWindow);
+        LOGCATE("%s: Preview surface set, size=%dx%d", TAG, m_previewWidth, m_previewHeight);
+    }
+    
     return 0;
 }
 
+int TimelineEditor::InitPreviewRenderer() {
+    if (m_previewRenderer) {
+        return 0;
+    }
+    
+    if (!m_previewWindow) {
+        LOGCATE("%s: Preview window not set", TAG);
+        return -1;
+    }
+    
+    if (!m_timeline) {
+        LOGCATE("%s: Timeline not set", TAG);
+        return -1;
+    }
+    
+    m_previewRenderer = new NativeRender(m_previewWindow);
+    if (!m_previewRenderer) {
+        LOGCATE("%s: Failed to create preview renderer", TAG);
+        return -1;
+    }
+    
+    int videoWidth = m_timeline->GetWidth();
+    int videoHeight = m_timeline->GetHeight();
+    int dstSize[2] = {0};
+    m_previewRenderer->Init(videoWidth, videoHeight, dstSize);
+    
+    m_previewWidth = dstSize[0] > 0 ? dstSize[0] : videoWidth;
+    m_previewHeight = dstSize[1] > 0 ? dstSize[1] : videoHeight;
+    
+    if (m_rgbaBuffer) {
+        av_free(m_rgbaBuffer);
+        m_rgbaBuffer = nullptr;
+    }
+    if (m_rgbaFrame) {
+        av_frame_free(&m_rgbaFrame);
+        m_rgbaFrame = nullptr;
+    }
+    
+    int bufferSize = av_image_get_buffer_size(AV_PIX_FMT_RGBA, m_previewWidth, m_previewHeight, 1);
+    m_rgbaBuffer = (uint8_t*)av_malloc(bufferSize);
+    if (!m_rgbaBuffer) {
+        LOGCATE("%s: Failed to allocate RGBA buffer", TAG);
+        return -1;
+    }
+    
+    m_rgbaFrame = av_frame_alloc();
+    if (!m_rgbaFrame) {
+        LOGCATE("%s: Failed to allocate RGBA frame", TAG);
+        av_free(m_rgbaBuffer);
+        m_rgbaBuffer = nullptr;
+        return -1;
+    }
+    
+    av_image_fill_arrays(m_rgbaFrame->data, m_rgbaFrame->linesize, m_rgbaBuffer, 
+                        AV_PIX_FMT_RGBA, m_previewWidth, m_previewHeight, 1);
+    m_rgbaFrame->width = m_previewWidth;
+    m_rgbaFrame->height = m_previewHeight;
+    m_rgbaFrame->format = AV_PIX_FMT_RGBA;
+    
+    m_swsContextSrcWidth = 0;
+    m_swsContextSrcHeight = 0;
+    m_swsContextSrcFormat = AV_PIX_FMT_NONE;
+    m_swsContextDstWidth = m_previewWidth;
+    m_swsContextDstHeight = m_previewHeight;
+    
+    LOGCATE("%s: Preview renderer initialized with video size %dx%d, output size %dx%d", 
+             TAG, videoWidth, videoHeight, m_previewWidth, m_previewHeight);
+    return 0;
+}
+
+void TimelineEditor::UninitPreviewRenderer() {
+    if (m_swsContext) {
+        sws_freeContext(m_swsContext);
+        m_swsContext = nullptr;
+    }
+    if (m_rgbaFrame) {
+        av_frame_free(&m_rgbaFrame);
+        m_rgbaFrame = nullptr;
+    }
+    if (m_rgbaBuffer) {
+        av_free(m_rgbaBuffer);
+        m_rgbaBuffer = nullptr;
+    }
+    if (m_previewRenderer) {
+        m_previewRenderer->UnInit();
+        delete m_previewRenderer;
+        m_previewRenderer = nullptr;
+    }
+}
+
+int TimelineEditor::RenderPreviewFrame(int64_t positionMs) {
+    if (!m_timeline) {
+        LOGCATE("%s: Timeline not ready", TAG);
+        return -1;
+    }
+
+    int64_t positionUs = positionMs * 1000;
+
+    TimelineClip* clip = m_timeline->GetClipAtTime(positionUs);
+    if (!clip) {
+        LOGCATE("%s: No clip found at time %ld", TAG, positionUs);
+        return -1;
+    }
+
+    int64_t clipStartTime = clip->GetTimelineStartTime();
+    int64_t clipLocalTime = positionUs - clipStartTime;
+
+    if (clip->SeekToTime(clipLocalTime) != 0) {
+        LOGCATE("%s: Failed to seek to time %ld", TAG, clipLocalTime);
+        return -1;
+    }
+
+    AVFrame* frame = nullptr;
+    int ret = clip->DecodeFrame(&frame);
+    if (ret != 0 || !frame) {
+        LOGCATE("%s: Failed to decode frame, ret=%d", TAG, ret);
+        return -1;
+    }
+
+    if (frame->width <= 0 || frame->height <= 0) {
+        LOGCATE("%s: Invalid frame size: %dx%d", TAG, frame->width, frame->height);
+        return -1;
+    }
+
+    if (frame->format < 0) {
+        LOGCATE("%s: Invalid frame format: %d", TAG, frame->format);
+        return -1;
+    }
+
+    LOGCATE("%s: Decoded frame at position %ldms, frame pts=%ld, frame=%p", TAG, positionMs, frame->pts, frame);
+
+    if (m_renderType == RENDER_TYPE_OPENGL && m_glRender) {
+        LOGCATE("%s: OpenGL rendering path, calling RenderFrameToWindow, m_glRender=%p", TAG, m_glRender);
+        int renderResult = m_glRender->RenderFrameToWindow(frame);
+        if (renderResult == 0) {
+            LOGCATE("%s: Rendered frame via OpenGL at position %ldms", TAG, positionMs);
+        } else {
+            LOGCATE("%s: OpenGL rendering failed with result=%d", TAG, renderResult);
+        }
+    } else if (m_renderType == RENDER_TYPE_OPENGL && !m_glRender) {
+        LOGCATE("%s: OpenGL rendering path, but m_glRender is null!", TAG);
+    } else if (m_renderType == RENDER_TYPE_ANWINDOW && m_previewWindow && m_previewRenderer) {
+        int srcWidth = frame->width;
+        int srcHeight = frame->height;
+        AVPixelFormat srcFormat = (AVPixelFormat)frame->format;
+        int dstWidth = m_previewWidth;
+        int dstHeight = m_previewHeight;
+
+        if (!m_rgbaFrame || !m_rgbaBuffer) {
+            LOGCATE("%s: RGBA frame not initialized", TAG);
+            return -1;
+        }
+
+        if (!m_swsContext || m_swsContextSrcWidth != srcWidth ||
+            m_swsContextSrcHeight != srcHeight || m_swsContextSrcFormat != srcFormat) {
+            if (m_swsContext) {
+                sws_freeContext(m_swsContext);
+                m_swsContext = nullptr;
+            }
+
+            m_swsContext = sws_getContext(srcWidth, srcHeight, srcFormat,
+                                         dstWidth, dstHeight, AV_PIX_FMT_RGBA,
+                                         SWS_FAST_BILINEAR, NULL, NULL, NULL);
+            if (!m_swsContext) {
+                LOGCATE("%s: Failed to create sws context", TAG);
+                return -1;
+            }
+
+            m_swsContextSrcWidth = srcWidth;
+            m_swsContextSrcHeight = srcHeight;
+            m_swsContextSrcFormat = srcFormat;
+        }
+
+        sws_scale(m_swsContext, frame->data, frame->linesize, 0, srcHeight,
+                  m_rgbaFrame->data, m_rgbaFrame->linesize);
+
+        m_previewRenderer->RenderVideoFrame(m_rgbaFrame);
+        LOGCATE("%s: Rendered frame via ANativeWindow at position %ldms", TAG, positionMs);
+    }
+
+    return 0;
+}
+
+void TimelineEditor::PreviewThreadFunc() {
+    LOGCATE("%s: Preview thread started", TAG);
+    
+    int64_t duration = m_timeline ? m_timeline->GetDuration() / 1000 : 0;
+    int frameRate = m_timeline ? m_timeline->GetFrameRate() : 30;
+    int64_t frameInterval = 1000 / (frameRate > 0 ? frameRate : 30);
+    
+    while (m_previewRunning) {
+        if (m_previewPaused) {
+            std::unique_lock<std::mutex> lock(m_previewMutex);
+            m_previewCV.wait(lock, [this] { 
+                return !m_previewPaused || !m_previewRunning; 
+            });
+            if (!m_previewRunning) break;
+            continue;
+        }
+        
+        if (m_timeline) {
+            m_currentPosition += frameInterval;
+            if (m_currentPosition >= duration) {
+                m_currentPosition = 0;
+            }
+            
+            NotifyPositionChanged(m_currentPosition);
+            
+            // 对于 OpenGL 渲染，设置需要渲染的标志，让 GLSurfaceView 的渲染线程处理
+            if (m_renderType == RENDER_TYPE_OPENGL) {
+                m_needRender = true;
+            }
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(frameInterval));
+    }
+    
+    LOGCATE("%s: Preview thread stopped", TAG);
+}
+
+void TimelineEditor::NotifyPositionChanged(int64_t positionMs) {
+    LOGCATE("%s: NotifyPositionChanged called, position=%ld", TAG, positionMs);
+    bool isAttach = false;
+    JNIEnv* env = GetJNIEnv(&isAttach);
+    if (env && m_javaObj) {
+        jclass clazz = env->GetObjectClass(m_javaObj);
+        if (clazz) {
+            jmethodID methodId = env->GetMethodID(clazz, "onEditorEvent", "(IF)V");
+            if (methodId) {
+                LOGCATE("%s: Calling onEditorEvent with MSG_PREVIEW_POSITION, position=%ld", TAG, positionMs);
+                env->CallVoidMethod(m_javaObj, methodId, 
+                                   (jint)MSG_PREVIEW_POSITION, (jfloat)positionMs);
+            } else {
+                LOGCATE("%s: Failed to get methodId for onEditorEvent", TAG);
+            }
+            env->DeleteLocalRef(clazz);
+        } else {
+            LOGCATE("%s: Failed to get class for m_javaObj", TAG);
+        }
+    } else {
+        LOGCATE("%s: env=%p, m_javaObj=%p", TAG, env, m_javaObj);
+    }
+    if (isAttach && m_javaVM) {
+        m_javaVM->DetachCurrentThread();
+    }
+}
+
+int TimelineEditor::PreviewFrame(int64_t positionMs) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    
+    if (!m_timeline) {
+        LOGCATE("%s: Timeline not ready", TAG);
+        return -1;
+    }
+    
+    m_currentPosition = positionMs;
+    return RenderPreviewFrame(positionMs);
+}
+
 int TimelineEditor::StartPreview() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    
+    if (m_previewRunning) {
+        LOGCATE("%s: Preview already running", TAG);
+        return 0;
+    }
+    
+    if (!m_timeline) {
+        LOGCATE("%s: No timeline to preview", TAG);
+        return -1;
+    }
+    
+    if (m_renderType == RENDER_TYPE_ANWINDOW && !m_previewWindow) {
+        LOGCATE("%s: No preview surface set", TAG);
+        return -1;
+    }
+    
+    if (m_renderType == RENDER_TYPE_ANWINDOW) {
+        // 初始化预览渲染器
+        if (!m_previewRenderer) {
+            if (InitPreviewRenderer() != 0) {
+                LOGCATE("%s: Failed to init preview renderer", TAG);
+                return -1;
+            }
+        }
+    }
+    
+    m_previewRunning = true;
+    m_previewPaused = false;
+    m_needRender = false;
+    m_currentPosition = 0;
     m_state = EditorState::EDITOR_STATE_PREVIEWING;
+    
+    m_previewThread = new std::thread(&TimelineEditor::PreviewThreadFunc, this);
+    if (!m_previewThread) {
+        m_previewRunning = false;
+        m_state = EditorState::EDITOR_STATE_READY;
+        return -1;
+    }
+    
+    LOGCATE("%s: Preview started", TAG);
     return 0;
 }
 
 void TimelineEditor::StopPreview() {
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_previewRunning) {
+            return;
+        }
+        
+        m_previewRunning = false;
+        m_previewPaused = false;
+    }
+    
+    m_previewCV.notify_all();
+    
+    if (m_previewThread && m_previewThread->joinable()) {
+        m_previewThread->join();
+        delete m_previewThread;
+        m_previewThread = nullptr;
+    }
+    
+    // 清理预览渲染器
+    if (m_previewRenderer) {
+        delete m_previewRenderer;
+        m_previewRenderer = nullptr;
+    }
+    
+    // 释放预览窗口（仅在ANativeWindow渲染时）
+    if (m_renderType == RENDER_TYPE_ANWINDOW && m_previewWindow) {
+        ANativeWindow_release(m_previewWindow);
+        m_previewWindow = nullptr;
+    }
+    
     m_state = EditorState::EDITOR_STATE_READY;
+    LOGCATE("%s: Preview stopped", TAG);
+}
+
+bool TimelineEditor::IsPreviewing() {
+    return m_previewRunning && !m_previewPaused;
+}
+
+void TimelineEditor::PausePreview() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_previewRunning && !m_previewPaused) {
+        m_previewPaused = true;
+        LOGCATE("%s: Preview paused", TAG);
+    }
+}
+
+void TimelineEditor::ResumePreview() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_previewRunning && m_previewPaused) {
+        m_previewPaused = false;
+        m_previewCV.notify_all();
+        LOGCATE("%s: Preview resumed", TAG);
+    }
+}
+
+bool TimelineEditor::IsPreviewPaused() {
+    return m_previewPaused;
+}
+
+int TimelineEditor::SeekToPosition(int64_t positionMs) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_currentPosition = positionMs;
+    LOGCATE("%s: Seek to position %ldms", TAG, positionMs);
+    return 0;
+}
+
+int TimelineEditor::OnSurfaceCreated(int renderType) {
+    LOGCATE("%s: OnSurfaceCreated, renderType=%d", TAG, renderType);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_renderType = renderType;
+    if (m_renderType == RENDER_TYPE_OPENGL) {
+        if (!m_glRender) {
+            m_glRender = new TimelineGLRender();
+        }
+        if (m_glRender) {
+            // 尝试获取 GLSurfaceView 的 EGL 上下文
+            EGLDisplay eglDisplay = eglGetCurrentDisplay();
+            EGLContext eglContext = eglGetCurrentContext();
+            
+            if (eglDisplay != EGL_NO_DISPLAY && eglContext != EGL_NO_CONTEXT) {
+                LOGCATE("%s: Using GLSurfaceView EGL context: display=%p, context=%p", 
+                        TAG, eglDisplay, eglContext);
+                if (m_glRender->InitWithEGLContext(eglContext, eglDisplay) != 0) {
+                    LOGCATE("%s: InitWithEGLContext failed", TAG);
+                }
+            } else {
+                LOGCATE("%s: No current EGL context found, creating new one", TAG);
+                m_glRender->Init();
+            }
+        }
+    }
+    return 0;
+}
+
+int TimelineEditor::OnSurfaceChanged(int renderType, int width, int height) {
+    LOGCATE("%s: OnSurfaceChanged, renderType=%d, size=%dx%d", TAG, renderType, width, height);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_surfaceWidth = width;
+    m_surfaceHeight = height;
+    if (m_renderType == RENDER_TYPE_OPENGL && m_glRender) {
+        m_glRender->SetSurfaceSize(width, height);
+    }
+    return 0;
+}
+
+int TimelineEditor::OnDrawFrame(int renderType) {
+    LOGCATE("%s: OnDrawFrame called, renderType=%d, m_glRender=%p", TAG, renderType, m_glRender);
+    
+    if (renderType != RENDER_TYPE_OPENGL) {
+        LOGCATE("%s: OnDrawFrame - renderType is not OPENGL, returning", TAG);
+        return 0;
+    }
+
+    if (!m_glRender) {
+        LOGCATE("%s: OnDrawFrame - m_glRender is null, creating new TimelineGLRender", TAG);
+        m_glRender = new TimelineGLRender();
+        if (m_glRender) {
+            m_glRender->Init();
+        }
+        LOGCATE("%s: OnDrawFrame - m_glRender created: %p", TAG, m_glRender);
+    }
+    
+    if (!m_timeline || m_timeline->GetClipCount() == 0) {
+        LOGCATE("%s: OnDrawFrame - conditions not met: m_glRender=%p, m_timeline=%p, clipCount=%d", 
+                TAG, m_glRender, m_timeline, m_timeline ? m_timeline->GetClipCount() : 0);
+        return 0;
+    }
+
+    bool previewRunning = m_previewRunning.load();
+    bool previewPaused = m_previewPaused.load();
+    LOGCATE("%s: OnDrawFrame - m_previewRunning=%d, m_previewPaused=%d, m_currentPosition=%ld", 
+            TAG, previewRunning, previewPaused, m_currentPosition);
+
+    if (previewRunning && !previewPaused) {
+        LOGCATE("%s: OnDrawFrame - calling RenderPreviewFrame", TAG);
+        int renderResult = RenderPreviewFrame(m_currentPosition);
+        if (renderResult != 0) {
+            LOGCATE("%s: OnDrawFrame - RenderPreviewFrame failed with result=%d", TAG, renderResult);
+        }
+    } else {
+        LOGCATE("%s: OnDrawFrame - preview not running or paused, skipping RenderPreviewFrame", TAG);
+    }
+
+    return 0;
+}
+
+bool TimelineEditor::CheckAndClearNeedRender() {
+    if (m_needRender) {
+        m_needRender = false;
+        return true;
+    }
+    return false;
 }

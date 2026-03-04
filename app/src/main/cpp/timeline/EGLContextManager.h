@@ -11,6 +11,7 @@ public:
 
     // 初始化 EGL 上下文（离屏）
     int Init(int width, int height);
+    int InitWithExternalContext(EGLContext eglContext, EGLDisplay eglDisplay);
     void Uninit();
 
     // 使当前线程的 EGL 上下文有效

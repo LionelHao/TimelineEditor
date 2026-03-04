@@ -1,8 +1,11 @@
 #include "TimelineGLRender.h"
 #include "GLUtils.h"
 #include <android/log.h>
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <string.h>
 
 #define TAG "TimelineGLRender"
 
@@ -26,6 +29,34 @@ static const char* RGBA_FRAGMENT_SHADER =
     "\n"
     "void main() {\n"
     "    outColor = texture(s_texture, v_texCoord);\n"
+    "}\n";
+
+// YUV转RGB着色器（NV12格式）
+static const char* YUV_VERTEX_SHADER = 
+    "#version 300 es\n"
+    "layout(location = 0) in vec4 a_position;\n"
+    "layout(location = 1) in vec2 a_texCoord;\n"
+    "out vec2 v_texCoord;\n"
+    "void main() {\n"
+    "    gl_Position = a_position;\n"
+    "    v_texCoord = a_texCoord;\n"
+    "}\n";
+
+static const char* YUV_FRAGMENT_SHADER = 
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "in vec2 v_texCoord;\n"
+    "layout(location = 0) out vec4 outColor;\n"
+    "uniform sampler2D s_yTexture;\n"
+    "uniform sampler2D s_uvTexture;\n"
+    "\n"
+    "void main() {\n"
+    "    float y = texture(s_yTexture, v_texCoord).r;\n"
+    "    vec2 uv = texture(s_uvTexture, v_texCoord).rg - 0.5;\n"
+    "    float r = y + 1.402 * uv.y;\n"
+    "    float g = y - 0.344 * uv.x - 0.714 * uv.y;\n"
+    "    float b = y + 1.772 * uv.x;\n"
+    "    outColor = vec4(r, g, b, 1.0);\n"
     "}\n";
 
 // 顶点坐标
@@ -65,6 +96,20 @@ TimelineGLRender::TimelineGLRender()
     , m_blurTexCoordLoc(-1)
     , m_blurTextureLoc(-1)
     , m_blurRadiusLoc(-1)
+    , m_yuvProgram(0)
+    , m_yuvVAO(0)
+    , m_yuvPosLoc(-1)
+    , m_yuvTexCoordLoc(-1)
+    , m_yuvYTexLoc(-1)
+    , m_yuvUVTexLoc(-1)
+    , m_yTexture(0)
+    , m_uvTexture(0)
+    , m_fbo1(0), m_fbo2(0), m_fbo3(0)
+    , m_texture1(0), m_texture2(0), m_texture3(0)
+    , m_yBuffer(nullptr)
+    , m_uvBuffer(nullptr)
+    , m_yBufferSize(0)
+    , m_uvBufferSize(0)
 {
 }
 
@@ -73,44 +118,154 @@ TimelineGLRender::~TimelineGLRender() {
     Uninit();
 }
 
-int TimelineGLRender::Init(int width, int height) {
+int TimelineGLRender::Init() {
     if (m_initialized) {
         LOGCATE("%s: Already initialized", TAG);
         return 0;
     }
 
-    m_width = width;
-    m_height = height;
+    m_width = 1920;
+    m_height = 1080;
 
-    // 1. 初始化 EGL 上下文
-    if (m_eglContext.Init(width, height) != 0) {
+    if (m_eglContext.Init(m_width, m_height) != 0) {
         LOGCATE("%s: EGLContext init failed", TAG);
         return -1;
     }
 
-    // 2. 初始化 RGBA 渲染器
     if (InitRGBARenderer() != 0) {
         LOGCATE("%s: InitRGBARenderer failed", TAG);
         m_eglContext.Uninit();
         return -1;
     }
 
-    // 3. 初始化水印滤镜
-    m_watermarkFilter = new WatermarkFilter();
-    if (m_watermarkFilter) {
-        m_watermarkFilter->Init();
-        LOGCATE("%s: WatermarkFilter initialized", TAG);
-    }
-
-    // 4. 初始化高斯模糊渲染器
-    if (InitBlurRenderer() != 0) {
-        LOGCATE("%s: InitBlurRenderer failed", TAG);
+    if (InitYUVRenderer() != 0) {
+        LOGCATE("%s: InitYUVRenderer failed", TAG);
         m_eglContext.Uninit();
         return -1;
     }
 
+    m_watermarkFilter = new WatermarkFilter();
+    if (m_watermarkFilter) {
+        m_watermarkFilter->Init();
+    }
+
+    if (InitBlurRenderer() != 0) {
+        LOGCATE("%s: InitBlurRenderer failed", TAG);
+    }
+
+    if (InitReusableResources() != 0) {
+        LOGCATE("%s: InitReusableResources failed", TAG);
+    }
+
     m_initialized = true;
-    LOGCATE("%s: Initialized successfully (%dx%d)", TAG, width, height);
+    LOGCATE("%s: Initialized", TAG);
+    return 0;
+}
+
+int TimelineGLRender::InitWithEGLContext(EGLContext eglContext, EGLDisplay eglDisplay) {
+    if (m_initialized) {
+        LOGCATE("%s: Already initialized", TAG);
+        return 0;
+    }
+
+    m_width = 1920;
+    m_height = 1080;
+
+    if (m_eglContext.InitWithExternalContext(eglContext, eglDisplay) != 0) {
+        LOGCATE("%s: EGLContext init with external context failed", TAG);
+        return -1;
+    }
+
+    if (InitRGBARenderer() != 0) {
+        LOGCATE("%s: InitRGBARenderer failed", TAG);
+        m_eglContext.Uninit();
+        return -1;
+    }
+
+    if (InitYUVRenderer() != 0) {
+        LOGCATE("%s: InitYUVRenderer failed", TAG);
+        m_eglContext.Uninit();
+        return -1;
+    }
+
+    m_watermarkFilter = new WatermarkFilter();
+    if (m_watermarkFilter) {
+        m_watermarkFilter->Init();
+    }
+
+    if (InitBlurRenderer() != 0) {
+        LOGCATE("%s: InitBlurRenderer failed", TAG);
+    }
+
+    if (InitReusableResources() != 0) {
+        LOGCATE("%s: InitReusableResources failed", TAG);
+    }
+
+    m_initialized = true;
+    LOGCATE("%s: Initialized with external EGL context", TAG);
+    return 0;
+}
+
+void TimelineGLRender::SetSurfaceSize(int width, int height) {
+    if (!m_initialized) {
+        return;
+    }
+    m_width = width;
+    m_height = height;
+    LOGCATE("%s: Set surface size to %dx%d", TAG, width, height);
+}
+
+int TimelineGLRender::RenderFrameToWindow(AVFrame* avFrame) {
+    LOGCATE("%s: RenderFrameToWindow called, m_initialized=%d, avFrame=%p", TAG, m_initialized, avFrame);
+    if (!m_initialized || !avFrame) {
+        LOGCATE("%s: RenderFrameToWindow - conditions not met", TAG);
+        return -1;
+    }
+
+    if (m_eglContext.GetSurface() != EGL_NO_SURFACE) {
+        if (!m_eglContext.MakeCurrent()) {
+            LOGCATE("%s: Failed to make EGL context current", TAG);
+            return -1;
+        }
+    }
+    LOGCATE("%s: EGL context made current, surface=%p", TAG, m_eglContext.GetSurface());
+
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    if (avFrame->format == AV_PIX_FMT_RGBA) {
+        GLuint texture = 0;
+        UploadRGBAToTexture(avFrame->data[0], avFrame->width, avFrame->height, &texture);
+
+        glUseProgram(m_rgbaProgram);
+        glBindVertexArray(m_rgbaVAO);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glUniform1i(m_rgbaTextureLoc, 0);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
+
+        glDeleteTextures(1, &texture);
+    } else if (avFrame->format == AV_PIX_FMT_YUV420P || avFrame->format == AV_PIX_FMT_YUVJ420P) {
+        UploadYUVToTextures(avFrame);
+
+        glUseProgram(m_yuvProgram);
+        glBindVertexArray(m_yuvVAO);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, m_yTexture);
+        glUniform1i(m_yuvYTexLoc, 0);
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, m_uvTexture);
+        glUniform1i(m_yuvUVTexLoc, 1);
+
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
+    }
+
+    EGLSurface surface = m_eglContext.GetSurface();
+    LOGCATE("%s: RenderFrameToWindow - surface=%p", TAG, surface);
+    if (surface != EGL_NO_SURFACE) {
+        m_eglContext.SwapBuffers();
+    }
     return 0;
 }
 
@@ -119,11 +274,17 @@ void TimelineGLRender::Uninit() {
         return;
     }
 
+    // 销毁复用资源
+    UninitReusableResources();
+
     // 销毁水印滤镜 - 析构函数会自己清理资源
     if (m_watermarkFilter) {
         delete m_watermarkFilter;
         m_watermarkFilter = nullptr;
     }
+
+    // 销毁 YUV 渲染器
+    UninitYUVRenderer();
 
     // 销毁 RGBA 渲染器
     UninitRGBARenderer();
@@ -169,9 +330,6 @@ int TimelineGLRender::RenderFrame(AVFrame* avFrame, uint8_t** outNV12Data, int* 
         return -1;
     }
 
-    LOGCATE("%s: RenderFrame start, frame size=%dx%d, format=%d, hasWatermark=%d, watermarkFilter=%p", 
-            TAG, avFrame->width, avFrame->height, avFrame->format, m_hasWatermark, m_watermarkFilter);
-
     if (!m_eglContext.MakeCurrent()) {
         LOGCATE("%s: MakeCurrent failed", TAG);
         return -1;
@@ -205,185 +363,61 @@ int TimelineGLRender::RenderFrame(AVFrame* avFrame, uint8_t** outNV12Data, int* 
     
     offsetX = (canvasW - dstW) / 2;
     offsetY = (canvasH - dstH) / 2;
+
+    // 检查是否支持GPU YUV转换
+    // YUV420P, YUVJ420P (JPEG色彩空间的YUV420P), NV12等格式
+    AVPixelFormat pixFormat = (AVPixelFormat)avFrame->format;
+    bool useGpuYuv = (pixFormat == AV_PIX_FMT_YUV420P || 
+                      pixFormat == AV_PIX_FMT_YUVJ420P ||
+                      pixFormat == AV_PIX_FMT_NV12);
     
-    LOGCATE("%s: Video aspect=%.2f, canvas aspect=%.2f, scaled to %dx%d, offset=(%d,%d)", 
-            TAG, srcAspect, canvasAspect, dstW, dstH, offsetX, offsetY);
+    LOGCATE("%s: Frame format=%d, useGpuYuv=%d, size=%dx%d, canvas=%dx%d", 
+            TAG, avFrame->format, useGpuYuv, srcW, srcH, canvasW, canvasH);
 
-    // 1. 用 sws_scale 把 AVFrame 转换为 RGBA（拉伸填满画布，用于背景）
-    int bgRgbaSize = canvasW * canvasH * 4;
-    uint8_t* bgRgbaBuffer = (uint8_t*)malloc(bgRgbaSize);
-    if (!bgRgbaBuffer) {
-        LOGCATE("%s: malloc failed for background RGBA buffer", TAG);
-        return -1;
-    }
+    // 1. 渲染背景（拉伸填满画布）
+    if (useGpuYuv) {
+        // GPU YUV转换
+        UploadYUVToTextures(avFrame);
+        RenderYUVToFBO(m_fbo1, canvasW, canvasH, 0, 0);
+    } else {
+        // CPU sws_scale转换
+        int bgRgbaSize = canvasW * canvasH * 4;
+        uint8_t* bgRgbaBuffer = (uint8_t*)malloc(bgRgbaSize);
+        if (!bgRgbaBuffer) {
+            m_eglContext.DoneCurrent();
+            return -1;
+        }
 
-    SwsContext* bgSwsCtx = sws_getContext(
-        srcW, srcH, (AVPixelFormat)avFrame->format,
-        canvasW, canvasH, AV_PIX_FMT_RGBA,
-        SWS_BILINEAR, nullptr, nullptr, nullptr);
+        SwsContext* bgSwsCtx = sws_getContext(
+            srcW, srcH, (AVPixelFormat)avFrame->format,
+            canvasW, canvasH, AV_PIX_FMT_RGBA,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
 
-    if (!bgSwsCtx) {
-        LOGCATE("%s: sws_getContext for background failed", TAG);
+        if (!bgSwsCtx) {
+            free(bgRgbaBuffer);
+            m_eglContext.DoneCurrent();
+            return -1;
+        }
+
+        uint8_t* bgDstData[4] = { bgRgbaBuffer, nullptr, nullptr, nullptr };
+        int bgDstLinesize[4] = { canvasW * 4, 0, 0, 0 };
+
+        sws_scale(bgSwsCtx, avFrame->data, avFrame->linesize, 0, srcH, bgDstData, bgDstLinesize);
+        sws_freeContext(bgSwsCtx);
+
+        GLuint bgTexture = 0;
+        UploadRGBAToTexture(bgRgbaBuffer, canvasW, canvasH, &bgTexture);
         free(bgRgbaBuffer);
-        return -1;
-    }
 
-    uint8_t* bgDstData[4] = { bgRgbaBuffer, nullptr, nullptr, nullptr };
-    int bgDstLinesize[4] = { canvasW * 4, 0, 0, 0 };
-
-    sws_scale(bgSwsCtx, avFrame->data, avFrame->linesize, 0, srcH, bgDstData, bgDstLinesize);
-    sws_freeContext(bgSwsCtx);
-
-    LOGCATE("%s: Converted to background RGBA, size=%dx%d", TAG, canvasW, canvasH);
-
-    // 2. 上传背景 RGBA 到纹理
-    GLuint bgTexture = 0;
-    if (UploadRGBAToTexture(bgRgbaBuffer, canvasW, canvasH, &bgTexture) != 0) {
-        LOGCATE("%s: UploadRGBAToTexture for background failed", TAG);
-        free(bgRgbaBuffer);
-        return -1;
-    }
-    free(bgRgbaBuffer);
-
-    LOGCATE("%s: Uploaded background RGBA texture: %d", TAG, bgTexture);
-
-    // 3. 用 sws_scale 把 AVFrame 转换为 RGBA（保持宽高比，用于前景）
-    int fgRgbaSize = dstW * dstH * 4;
-    uint8_t* fgRgbaBuffer = (uint8_t*)malloc(fgRgbaSize);
-    if (!fgRgbaBuffer) {
-        LOGCATE("%s: malloc failed for foreground RGBA buffer", TAG);
+        RenderStretchToFBO(bgTexture, m_fbo1);
         glDeleteTextures(1, &bgTexture);
-        return -1;
     }
 
-    SwsContext* fgSwsCtx = sws_getContext(
-        srcW, srcH, (AVPixelFormat)avFrame->format,
-        dstW, dstH, AV_PIX_FMT_RGBA,
-        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    // 2. 对FBO1的纹理进行高斯模糊，输出到FBO2
+    ApplyGaussianBlur(m_texture1, m_fbo2, canvasW, canvasH, 25.0f);
 
-    if (!fgSwsCtx) {
-        LOGCATE("%s: sws_getContext for foreground failed", TAG);
-        free(fgRgbaBuffer);
-        glDeleteTextures(1, &bgTexture);
-        return -1;
-    }
-
-    uint8_t* fgDstData[4] = { fgRgbaBuffer, nullptr, nullptr, nullptr };
-    int fgDstLinesize[4] = { dstW * 4, 0, 0, 0 };
-
-    sws_scale(fgSwsCtx, avFrame->data, avFrame->linesize, 0, srcH, fgDstData, fgDstLinesize);
-    sws_freeContext(fgSwsCtx);
-
-    LOGCATE("%s: Converted to foreground RGBA, size=%dx%d", TAG, dstW, dstH);
-
-    // 4. 上传前景 RGBA 到纹理
-    GLuint fgTexture = 0;
-    if (UploadRGBAToTexture(fgRgbaBuffer, dstW, dstH, &fgTexture) != 0) {
-        LOGCATE("%s: UploadRGBAToTexture for foreground failed", TAG);
-        free(fgRgbaBuffer);
-        glDeleteTextures(1, &bgTexture);
-        return -1;
-    }
-    free(fgRgbaBuffer);
-
-    LOGCATE("%s: Uploaded foreground RGBA texture: %d", TAG, fgTexture);
-
-    // 5. 创建多个 FBO 和纹理
-    GLuint texture1 = CreateTexture();
-    glBindTexture(GL_TEXTURE_2D, texture1);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, canvasW, canvasH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    
-    GLuint fbo1 = 0;
-    glGenFramebuffers(1, &fbo1);
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo1);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture1, 0);
-    
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        LOGCATE("%s: FBO 1 not complete", TAG);
-        glDeleteTextures(1, &bgTexture);
-        glDeleteTextures(1, &fgTexture);
-        glDeleteTextures(1, &texture1);
-        glDeleteFramebuffers(1, &fbo1);
-        return -1;
-    }
-
-    GLuint texture2 = CreateTexture();
-    glBindTexture(GL_TEXTURE_2D, texture2);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, canvasW, canvasH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    
-    GLuint fbo2 = 0;
-    glGenFramebuffers(1, &fbo2);
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo2);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture2, 0);
-    
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        LOGCATE("%s: FBO 2 not complete", TAG);
-        glDeleteTextures(1, &bgTexture);
-        glDeleteTextures(1, &fgTexture);
-        glDeleteTextures(1, &texture1);
-        glDeleteFramebuffers(1, &fbo1);
-        glDeleteTextures(1, &texture2);
-        glDeleteFramebuffers(1, &fbo2);
-        return -1;
-    }
-
-    GLuint texture3 = CreateTexture();
-    glBindTexture(GL_TEXTURE_2D, texture3);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, canvasW, canvasH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    
-    GLuint fbo3 = 0;
-    glGenFramebuffers(1, &fbo3);
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo3);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture3, 0);
-    
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        LOGCATE("%s: FBO 3 not complete", TAG);
-        glDeleteTextures(1, &bgTexture);
-        glDeleteTextures(1, &fgTexture);
-        glDeleteTextures(1, &texture1);
-        glDeleteFramebuffers(1, &fbo1);
-        glDeleteTextures(1, &texture2);
-        glDeleteFramebuffers(1, &fbo2);
-        glDeleteTextures(1, &texture3);
-        glDeleteFramebuffers(1, &fbo3);
-        return -1;
-    }
-    
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    LOGCATE("%s: Created textures & FBOs", TAG);
-
-    // 6. 将背景纹理拉伸渲染到 FBO1
-    if (RenderStretchToFBO(bgTexture, fbo1) != 0) {
-        LOGCATE("%s: RenderStretchToFBO failed", TAG);
-        glDeleteTextures(1, &bgTexture);
-        glDeleteTextures(1, &fgTexture);
-        glDeleteTextures(1, &texture1);
-        glDeleteFramebuffers(1, &fbo1);
-        glDeleteTextures(1, &texture2);
-        glDeleteFramebuffers(1, &fbo2);
-        glDeleteTextures(1, &texture3);
-        glDeleteFramebuffers(1, &fbo3);
-        return -1;
-    }
-    LOGCATE("%s: Rendered stretched background to FBO 1", TAG);
-
-    // 7. 对 FBO1 的纹理进行高斯模糊，输出到 FBO2
-    if (ApplyGaussianBlur(texture1, fbo2, canvasW, canvasH, 25.0f) != 0) {
-        LOGCATE("%s: ApplyGaussianBlur failed", TAG);
-        glDeleteTextures(1, &bgTexture);
-        glDeleteTextures(1, &fgTexture);
-        glDeleteTextures(1, &texture1);
-        glDeleteFramebuffers(1, &fbo1);
-        glDeleteTextures(1, &texture2);
-        glDeleteFramebuffers(1, &fbo2);
-        glDeleteTextures(1, &texture3);
-        glDeleteFramebuffers(1, &fbo3);
-        return -1;
-    }
-    LOGCATE("%s: Applied Gaussian blur to FBO 2", TAG);
-
-    // 8. 将模糊背景复制到 FBO3
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo3);
+    // 3. 将模糊背景复制到FBO3
+    glBindFramebuffer(GL_FRAMEBUFFER, m_fbo3);
     glViewport(0, 0, canvasW, canvasH);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -392,7 +426,7 @@ int TimelineGLRender::RenderFrame(AVFrame* avFrame, uint8_t** outNV12Data, int* 
     glBindVertexArray(m_rgbaVAO);
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, texture2);
+    glBindTexture(GL_TEXTURE_2D, m_texture2);
     glUniform1i(m_rgbaTextureLoc, 0);
 
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
@@ -400,63 +434,55 @@ int TimelineGLRender::RenderFrame(AVFrame* avFrame, uint8_t** outNV12Data, int* 
     glBindVertexArray(0);
     glUseProgram(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    LOGCATE("%s: Copied blurred background to FBO 3", TAG);
 
-    // 9. 将前景视频渲染到模糊背景上（FBO3）
-    if (RenderRGBAToFBOWithOffset(fgTexture, fbo3, dstW, dstH, offsetX, offsetY) != 0) {
-        LOGCATE("%s: RenderRGBAToFBOWithOffset failed", TAG);
-        glDeleteTextures(1, &bgTexture);
-        glDeleteTextures(1, &fgTexture);
-        glDeleteTextures(1, &texture1);
-        glDeleteFramebuffers(1, &fbo1);
-        glDeleteTextures(1, &texture2);
-        glDeleteFramebuffers(1, &fbo2);
-        glDeleteTextures(1, &texture3);
-        glDeleteFramebuffers(1, &fbo3);
-        return -1;
+    // 4. 将前景渲染到FBO3（保持宽高比，居中显示，需要混合）
+    if (useGpuYuv) {
+        // GPU YUV转换，渲染前景
+        UploadYUVToTextures(avFrame);
+        RenderYUVToFBOWithBlend(m_fbo3, dstW, dstH, offsetX, offsetY);
+    } else {
+        // CPU sws_scale转换前景
+        int fgRgbaSize = dstW * dstH * 4;
+        uint8_t* fgRgbaBuffer = (uint8_t*)malloc(fgRgbaSize);
+        if (fgRgbaBuffer) {
+            SwsContext* fgSwsCtx = sws_getContext(
+                srcW, srcH, (AVPixelFormat)avFrame->format,
+                dstW, dstH, AV_PIX_FMT_RGBA,
+                SWS_BILINEAR, nullptr, nullptr, nullptr);
+
+            if (fgSwsCtx) {
+                uint8_t* fgDstData[4] = { fgRgbaBuffer, nullptr, nullptr, nullptr };
+                int fgDstLinesize[4] = { dstW * 4, 0, 0, 0 };
+
+                sws_scale(fgSwsCtx, avFrame->data, avFrame->linesize, 0, srcH, fgDstData, fgDstLinesize);
+                sws_freeContext(fgSwsCtx);
+
+                GLuint fgTexture = 0;
+                UploadRGBAToTexture(fgRgbaBuffer, dstW, dstH, &fgTexture);
+                RenderRGBAToFBOWithOffset(fgTexture, m_fbo3, dstW, dstH, offsetX, offsetY);
+                glDeleteTextures(1, &fgTexture);
+            }
+            free(fgRgbaBuffer);
+        }
     }
-    LOGCATE("%s: Rendered foreground to FBO 3 with offset", TAG);
 
-    LOGCATE("%s: About to apply watermark: hasWatermark=%d, watermarkFilter=%p", TAG, m_hasWatermark, m_watermarkFilter);
-
-    // 10. 应用水印（如果有）
-    GLuint finalFBO = fbo3;
-    GLuint finalTexture = texture3;
+    // 5. 应用水印（如果有）
+    GLuint finalFBO = m_fbo3;
+    GLuint finalTexture = m_texture3;
     if (m_hasWatermark && m_watermarkFilter) {
-        LOGCATE("%s: Applying watermark filter!", TAG);
-        m_watermarkFilter->Apply(texture3, fbo1, canvasW, canvasH);
-        finalFBO = fbo1;
-        finalTexture = texture1;
-        LOGCATE("%s: Applied watermark", TAG);
+        m_watermarkFilter->Apply(m_texture3, m_fbo1, canvasW, canvasH);
+        finalFBO = m_fbo1;
+        finalTexture = m_texture1;
     }
 
-    // 11. 读回 NV12 数据
+    // 6. 读回NV12数据
     if (ReadBackNV12(finalFBO, canvasW, canvasH, outNV12Data, outNV12Size) != 0) {
         LOGCATE("%s: ReadBackNV12 failed", TAG);
-        glDeleteTextures(1, &bgTexture);
-        glDeleteTextures(1, &fgTexture);
-        glDeleteTextures(1, &texture1);
-        glDeleteFramebuffers(1, &fbo1);
-        glDeleteTextures(1, &texture2);
-        glDeleteFramebuffers(1, &fbo2);
-        glDeleteTextures(1, &texture3);
-        glDeleteFramebuffers(1, &fbo3);
+        m_eglContext.DoneCurrent();
         return -1;
     }
-    LOGCATE("%s: Read back NV12, size=%d", TAG, *outNV12Size);
-
-    // 清理
-    glDeleteTextures(1, &bgTexture);
-    glDeleteTextures(1, &fgTexture);
-    glDeleteTextures(1, &texture1);
-    glDeleteFramebuffers(1, &fbo1);
-    glDeleteTextures(1, &texture2);
-    glDeleteFramebuffers(1, &fbo2);
-    glDeleteTextures(1, &texture3);
-    glDeleteFramebuffers(1, &fbo3);
 
     m_eglContext.DoneCurrent();
-
     return 0;
 }
 
@@ -956,5 +982,412 @@ int TimelineGLRender::ApplyGaussianBlur(GLuint inputTexture, GLuint outputFBO, i
     glDeleteFramebuffers(1, &tempFBO);
 
     LOGCATE("%s: Applied Gaussian blur (radius=%.1f)", TAG, radius);
+    return 0;
+}
+
+int TimelineGLRender::InitYUVRenderer() {
+    m_yuvProgram = GLUtils::CreateProgram(YUV_VERTEX_SHADER, YUV_FRAGMENT_SHADER);
+    if (m_yuvProgram == 0) {
+        LOGCATE("%s: Create YUV program failed", TAG);
+        return -1;
+    }
+
+    m_yuvPosLoc = glGetAttribLocation(m_yuvProgram, "a_position");
+    m_yuvTexCoordLoc = glGetAttribLocation(m_yuvProgram, "a_texCoord");
+    m_yuvYTexLoc = glGetUniformLocation(m_yuvProgram, "s_yTexture");
+    m_yuvUVTexLoc = glGetUniformLocation(m_yuvProgram, "s_uvTexture");
+
+    glGenVertexArrays(1, &m_yuvVAO);
+    glGenBuffers(2, m_yuvVBO);
+    glGenBuffers(1, &m_yuvEBO);
+
+    glBindVertexArray(m_yuvVAO);
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_yuvVBO[0]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(verticesCoords), verticesCoords, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(m_yuvPosLoc);
+    glVertexAttribPointer(m_yuvPosLoc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_yuvVBO[1]);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(textureCoords), textureCoords, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(m_yuvTexCoordLoc);
+    glVertexAttribPointer(m_yuvTexCoordLoc, 2, GL_FLOAT, GL_FALSE, 0, 0);
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_yuvEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+
+    glBindVertexArray(0);
+
+    // 创建Y和UV纹理
+    glGenTextures(1, &m_yTexture);
+    glBindTexture(GL_TEXTURE_2D, m_yTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glGenTextures(1, &m_uvTexture);
+    glBindTexture(GL_TEXTURE_2D, m_uvTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    LOGCATE("%s: YUV renderer initialized", TAG);
+    return 0;
+}
+
+void TimelineGLRender::UninitYUVRenderer() {
+    if (m_yuvProgram) {
+        glDeleteProgram(m_yuvProgram);
+        m_yuvProgram = 0;
+    }
+    if (m_yuvVAO) {
+        glDeleteVertexArrays(1, &m_yuvVAO);
+        m_yuvVAO = 0;
+    }
+    glDeleteBuffers(2, m_yuvVBO);
+    glDeleteBuffers(1, &m_yuvEBO);
+    
+    if (m_yTexture) {
+        glDeleteTextures(1, &m_yTexture);
+        m_yTexture = 0;
+    }
+    if (m_uvTexture) {
+        glDeleteTextures(1, &m_uvTexture);
+        m_uvTexture = 0;
+    }
+    
+    LOGCATE("%s: YUV renderer uninitialized", TAG);
+}
+
+int TimelineGLRender::InitReusableResources() {
+    // 预分配缓冲区
+    m_yBufferSize = m_width * m_height;
+    m_uvBufferSize = m_width * m_height / 2;
+    
+    m_yBuffer = (uint8_t*)malloc(m_yBufferSize);
+    m_uvBuffer = (uint8_t*)malloc(m_uvBufferSize);
+    
+    if (!m_yBuffer || !m_uvBuffer) {
+        LOGCATE("%s: Failed to allocate buffers", TAG);
+        return -1;
+    }
+
+    // 创建复用的纹理
+    glGenTextures(1, &m_texture1);
+    glBindTexture(GL_TEXTURE_2D, m_texture1);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, m_width, m_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glGenTextures(1, &m_texture2);
+    glBindTexture(GL_TEXTURE_2D, m_texture2);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, m_width, m_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glGenTextures(1, &m_texture3);
+    glBindTexture(GL_TEXTURE_2D, m_texture3);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, m_width, m_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    // 创建复用的FBO
+    glGenFramebuffers(1, &m_fbo1);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_fbo1);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_texture1, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        LOGCATE("%s: FBO 1 not complete", TAG);
+        return -1;
+    }
+
+    glGenFramebuffers(1, &m_fbo2);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_fbo2);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_texture2, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        LOGCATE("%s: FBO 2 not complete", TAG);
+        return -1;
+    }
+
+    glGenFramebuffers(1, &m_fbo3);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_fbo3);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_texture3, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        LOGCATE("%s: FBO 3 not complete", TAG);
+        return -1;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    LOGCATE("%s: Reusable resources initialized", TAG);
+    return 0;
+}
+
+void TimelineGLRender::UninitReusableResources() {
+    if (m_yBuffer) {
+        free(m_yBuffer);
+        m_yBuffer = nullptr;
+    }
+    if (m_uvBuffer) {
+        free(m_uvBuffer);
+        m_uvBuffer = nullptr;
+    }
+    
+    if (m_texture1) glDeleteTextures(1, &m_texture1);
+    if (m_texture2) glDeleteTextures(1, &m_texture2);
+    if (m_texture3) glDeleteTextures(1, &m_texture3);
+    if (m_fbo1) glDeleteFramebuffers(1, &m_fbo1);
+    if (m_fbo2) glDeleteFramebuffers(1, &m_fbo2);
+    if (m_fbo3) glDeleteFramebuffers(1, &m_fbo3);
+    
+    m_texture1 = m_texture2 = m_texture3 = 0;
+    m_fbo1 = m_fbo2 = m_fbo3 = 0;
+    
+    LOGCATE("%s: Reusable resources uninitialized", TAG);
+}
+
+int TimelineGLRender::UploadYUVToTextures(AVFrame* avFrame) {
+    if (!avFrame) return -1;
+    
+    int srcW = avFrame->width;
+    int srcH = avFrame->height;
+    AVPixelFormat pixFormat = (AVPixelFormat)avFrame->format;
+    
+    // 根据格式提取Y和UV数据
+    if (pixFormat == AV_PIX_FMT_YUV420P || pixFormat == AV_PIX_FMT_YUVJ420P) {
+        // YUV420P/YUVJ420P: Y, U, V 分别存储
+        glBindTexture(GL_TEXTURE_2D, m_yTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, srcW, srcH, 0, GL_RED, GL_UNSIGNED_BYTE, avFrame->data[0]);
+        
+        // 合并UV为NV12格式
+        uint8_t* uv = m_uvBuffer;
+        uint8_t* u = avFrame->data[1];
+        uint8_t* v = avFrame->data[2];
+        int uvSize = srcW * srcH / 4;
+        for (int i = 0; i < uvSize; i++) {
+            uv[i * 2] = u[i];
+            uv[i * 2 + 1] = v[i];
+        }
+        
+        glBindTexture(GL_TEXTURE_2D, m_uvTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, srcW / 2, srcH / 2, 0, GL_RG, GL_UNSIGNED_BYTE, uv);
+    } else if (pixFormat == AV_PIX_FMT_NV12) {
+        // NV12: Y单独存储，UV交错存储
+        glBindTexture(GL_TEXTURE_2D, m_yTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, srcW, srcH, 0, GL_RED, GL_UNSIGNED_BYTE, avFrame->data[0]);
+        
+        glBindTexture(GL_TEXTURE_2D, m_uvTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, srcW / 2, srcH / 2, 0, GL_RG, GL_UNSIGNED_BYTE, avFrame->data[1]);
+    } else {
+        LOGCATE("%s: Unsupported pixel format: %d", TAG, avFrame->format);
+        return -1;
+    }
+    
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return 0;
+}
+
+int TimelineGLRender::RenderYUVToFBO(GLuint outputFBO, int dstW, int dstH, int offsetX, int offsetY) {
+    float left = (2.0f * offsetX / m_width) - 1.0f;
+    float right = (2.0f * (offsetX + dstW) / m_width) - 1.0f;
+    float bottom = (2.0f * offsetY / m_height) - 1.0f;
+    float top = (2.0f * (offsetY + dstH) / m_height) - 1.0f;
+
+    GLfloat vertices[] = {
+        left,  top,
+        left,  bottom,
+        right, bottom,
+        right, top,
+    };
+
+    glBindFramebuffer(GL_FRAMEBUFFER, outputFBO);
+    glViewport(0, 0, m_width, m_height);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_yuvVBO[0]);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
+
+    glUseProgram(m_yuvProgram);
+    glBindVertexArray(m_yuvVAO);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_yTexture);
+    glUniform1i(m_yuvYTexLoc, 0);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, m_uvTexture);
+    glUniform1i(m_yuvUVTexLoc, 1);
+
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+    glDisable(GL_BLEND);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // 恢复原始顶点数据
+    static const GLfloat originalVertices[] = {
+        -1.0f,  1.0f,
+        -1.0f, -1.0f,
+         1.0f, -1.0f,
+         1.0f,  1.0f,
+    };
+    glBindBuffer(GL_ARRAY_BUFFER, m_yuvVBO[0]);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(originalVertices), originalVertices);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    return 0;
+}
+
+int TimelineGLRender::RenderFrameToSurface(AVFrame* avFrame, ANativeWindow* window) {
+    if (!avFrame || !window) {
+        LOGCATE("%s: Invalid frame or window", TAG);
+        return -1;
+    }
+    
+    int srcW = avFrame->width;
+    int srcH = avFrame->height;
+    
+    // 获取窗口大小
+    int winW = ANativeWindow_getWidth(window);
+    int winH = ANativeWindow_getHeight(window);
+    
+    if (winW <= 0 || winH <= 0) {
+        LOGCATE("%s: Invalid window size: %dx%d", TAG, winW, winH);
+        return -1;
+    }
+    
+    // 设置缓冲区大小
+    int32_t result = ANativeWindow_setBuffersGeometry(window, winW, winH, WINDOW_FORMAT_RGBA_8888);
+    if (result < 0) {
+        LOGCATE("%s: Failed to set buffer geometry: %d", TAG, result);
+        return -1;
+    }
+    
+    // 锁定窗口缓冲区
+    ANativeWindow_Buffer buffer;
+    if (ANativeWindow_lock(window, &buffer, nullptr) != 0) {
+        LOGCATE("%s: Failed to lock window", TAG);
+        return -1;
+    }
+    
+    // 使用中间缓冲区来处理stride不一致的情况
+    int dstStride = buffer.stride * 4;
+    uint8_t* dstBuffer = (uint8_t*)malloc(winW * winH * 4);
+    if (!dstBuffer) {
+        LOGCATE("%s: Failed to allocate temp buffer", TAG);
+        ANativeWindow_unlockAndPost(window);
+        return -1;
+    }
+    
+    // 使用sws_scale将视频帧转换为RGBA格式
+    SwsContext* swsCtx = sws_getContext(
+        srcW, srcH, (AVPixelFormat)avFrame->format,
+        winW, winH, AV_PIX_FMT_RGBA,
+        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    
+    if (!swsCtx) {
+        LOGCATE("%s: Failed to create sws context", TAG);
+        free(dstBuffer);
+        ANativeWindow_unlockAndPost(window);
+        return -1;
+    }
+    
+    // 准备目标数据指针 - 使用临时缓冲区
+    uint8_t* dstData[4] = { dstBuffer, nullptr, nullptr, nullptr };
+    int dstLinesize[4] = { winW * 4, 0, 0, 0 };
+    
+    // 执行转换
+    sws_scale(swsCtx, avFrame->data, avFrame->linesize, 0, srcH, dstData, dstLinesize);
+    sws_freeContext(swsCtx);
+    
+    // 将临时缓冲区的数据复制到窗口缓冲区（处理stride）
+    uint8_t* srcPtr = dstBuffer;
+    uint8_t* dstPtr = (uint8_t*)buffer.bits;
+    int rowBytes = winW * 4;
+    for (int y = 0; y < winH; y++) {
+        memcpy(dstPtr, srcPtr, rowBytes);
+        srcPtr += rowBytes;
+        dstPtr += dstStride;
+    }
+    
+    free(dstBuffer);
+    
+    // 解锁并提交缓冲区
+    ANativeWindow_unlockAndPost(window);
+    
+    return 0;
+}
+
+int TimelineGLRender::RenderYUVToFBOWithBlend(GLuint outputFBO, int dstW, int dstH, int offsetX, int offsetY) {
+    float left = (2.0f * offsetX / m_width) - 1.0f;
+    float right = (2.0f * (offsetX + dstW) / m_width) - 1.0f;
+    float bottom = (2.0f * offsetY / m_height) - 1.0f;
+    float top = (2.0f * (offsetY + dstH) / m_height) - 1.0f;
+
+    GLfloat vertices[] = {
+        left,  top,
+        left,  bottom,
+        right, bottom,
+        right, top,
+    };
+
+    glBindFramebuffer(GL_FRAMEBUFFER, outputFBO);
+    glViewport(0, 0, m_width, m_height);
+
+    // 不清除背景，保留已有内容
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_yuvVBO[0]);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
+
+    glUseProgram(m_yuvProgram);
+    glBindVertexArray(m_yuvVAO);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_yTexture);
+    glUniform1i(m_yuvYTexLoc, 0);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, m_uvTexture);
+    glUniform1i(m_yuvUVTexLoc, 1);
+
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+    glDisable(GL_BLEND);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // 恢复原始顶点数据
+    static const GLfloat originalVertices[] = {
+        -1.0f,  1.0f,
+        -1.0f, -1.0f,
+         1.0f, -1.0f,
+         1.0f,  1.0f,
+    };
+    glBindBuffer(GL_ARRAY_BUFFER, m_yuvVBO[0]);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(originalVertices), originalVertices);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
     return 0;
 }

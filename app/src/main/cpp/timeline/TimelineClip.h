@@ -82,6 +82,7 @@ private:
     SwsContext* m_pSwsContext;
 
     int64_t m_currentPts;
+    int64_t m_seekTarget;
     bool m_isOpened;
 };
 

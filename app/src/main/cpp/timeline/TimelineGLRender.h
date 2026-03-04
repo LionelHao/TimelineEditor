@@ -16,19 +16,26 @@ public:
     TimelineGLRender();
     ~TimelineGLRender();
 
-    int Init(int width, int height);
+    int Init();
+    int InitWithEGLContext(EGLContext eglContext, EGLDisplay eglDisplay);
     void Uninit();
+    void SetSurfaceSize(int width, int height);
 
     int SetWatermark(const char* imagePath, float opacity, float scale, float offsetX, float offsetY);
 
     int RenderFrame(AVFrame* avFrame, uint8_t** outNV12Data, int* outNV12Size);
+    int RenderFrameToSurface(AVFrame* avFrame, ANativeWindow* window);
+    int RenderFrameToWindow(AVFrame* avFrame);
 
     EGLContextManager* GetEGLContext() { return &m_eglContext; }
 
 private:
     int UploadRGBAToTexture(uint8_t* rgbaData, int width, int height, GLuint* outTexture);
+    int UploadYUVToTextures(AVFrame* avFrame);
     int RenderRGBAToFBO(GLuint rgbaTexture, GLuint outputFBO);
     int RenderRGBAToFBOWithOffset(GLuint rgbaTexture, GLuint outputFBO, int textureW, int textureH, int offsetX, int offsetY);
+    int RenderYUVToFBO(GLuint outputFBO, int dstW, int dstH, int offsetX, int offsetY);
+    int RenderYUVToFBOWithBlend(GLuint outputFBO, int dstW, int dstH, int offsetX, int offsetY);
     int ReadBackNV12(GLuint outputFBO, int width, int height, uint8_t** outNV12Data, int* outNV12Size);
     GLuint CreateTexture();
     GLuint CreateFBO(int width, int height);
@@ -39,6 +46,11 @@ private:
     void UninitBlurRenderer();
     int ApplyGaussianBlur(GLuint inputTexture, GLuint outputFBO, int width, int height, float radius);
     int RenderStretchToFBO(GLuint rgbaTexture, GLuint outputFBO);
+    
+    int InitReusableResources();
+    void UninitReusableResources();
+    int InitYUVRenderer();
+    void UninitYUVRenderer();
 
 private:
     EGLContextManager m_eglContext;
@@ -68,6 +80,30 @@ private:
     GLint m_blurTexCoordLoc;
     GLint m_blurTextureLoc;
     GLint m_blurRadiusLoc;
+    
+    // YUV渲染器
+    GLuint m_yuvProgram;
+    GLuint m_yuvVAO;
+    GLuint m_yuvVBO[2];
+    GLuint m_yuvEBO;
+    GLint m_yuvPosLoc;
+    GLint m_yuvTexCoordLoc;
+    GLint m_yuvYTexLoc;
+    GLint m_yuvUVTexLoc;
+    
+    // YUV纹理（复用）
+    GLuint m_yTexture;
+    GLuint m_uvTexture;
+    
+    // 复用的FBO和纹理
+    GLuint m_fbo1, m_fbo2, m_fbo3;
+    GLuint m_texture1, m_texture2, m_texture3;
+    
+    // 预分配的缓冲区
+    uint8_t* m_yBuffer;
+    uint8_t* m_uvBuffer;
+    int m_yBufferSize;
+    int m_uvBufferSize;
 };
 
 #endif

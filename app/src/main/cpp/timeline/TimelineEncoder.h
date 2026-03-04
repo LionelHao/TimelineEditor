@@ -9,6 +9,10 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <vector>
+#include <algorithm>
+#include <fstream>
+#include <sstream>
 #include "ImageDef.h"
 #include "Timeline.h"
 #include "TimelineGLRender.h"
@@ -109,6 +113,8 @@ private:
     int RenderFrameWithOpenGL(AVFrame* frame, uint8_t** outNV12Data, int* outNV12Size);
 
     static void EncodeThreadFunc(TimelineEncoder* encoder);
+    void SavePerformanceData();
+    double CalculatePercentile(const std::vector<double>& data, double percentile);
     int ProcessTimelineFrame(Timeline* timeline, int64_t frameIndex, int64_t startFrameIndex = 0);
 
 private:
@@ -168,6 +174,17 @@ private:
     AVFrame* m_lastFrameCache;
     AVFrame* m_eofFrameCache;
     int64_t m_lastPresentationPts;
+    
+    // 性能数据收集
+    struct FramePerformanceData {
+        int64_t frameIndex;
+        double decodeTime;
+        double renderTime;
+        double encodeTime;
+    };
+    std::vector<FramePerformanceData> m_framePerformanceData;
+    struct timespec m_exportStartTime;
+    struct timespec m_exportEndTime;
 };
 
 #endif
